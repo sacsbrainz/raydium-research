@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -117,7 +118,7 @@ type TokenBalance struct {
 
 const (
 	programID = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
-	rpcURL    = "wss://solana-rpc.publicnode.com"
+	rpcURL    = "wss://solemn-fluent-glitter.solana-mainnet.quiknode.pro/a4b0c2d7fa048c4818a5f20dd20018d16ebdc4d3"
 )
 
 func main() {
@@ -183,6 +184,8 @@ func main() {
 			var blockSubscribe SolanaBlockSubscribe
 			if err := json.Unmarshal(rawResponse, &blockSubscribe); err != nil {
 				log.Printf("Error parsing block notification: %v", err)
+				// (TODO) SolanaBlockSubscribe version to hanlde legacy version
+				// Error parsing block notification: json: cannot unmarshal string into Go struct field .params.result.value.block.transactions.version of type int
 				continue
 			}
 
@@ -228,13 +231,14 @@ func loadIDL(filepath string) (*IDLStructure, error) {
 func processTransaction(data SolanaBlockSubscribe, idl *IDLStructure) {
 
 	block := data.Params.Result.Value.Block
-	// Transaction basic information
-	fmt.Println("=== Transaction Details ===")
+
+	// Print block details
+	fmt.Println("\n=== Block Details ===")
 	fmt.Printf("Block Number: %d\n", block.BlockHeight)
 	fmt.Printf("Block Timestamp: %d\n", block.BlockTime)
 	fmt.Printf("Block Hash: %s\n", block.Blockhash)
 
-	// handle transaction
+	// Process transactions
 	for _, txn := range block.Transactions {
 
 		// Decode the base64 transaction
@@ -252,57 +256,162 @@ func processTransaction(data SolanaBlockSubscribe, idl *IDLStructure) {
 
 		// Decode instructions using the IDL
 		for _, instr := range versionedTransaction.Message.Instructions {
-			decodeInstruction(instr, idl, versionedTransaction.Message, solana.MustPublicKeyFromBase58(programID))
+			decodeInstruction(instr, idl, versionedTransaction.Message)
 		}
 
 		// Attempt to deserialize as a legacy transaction (TODO)
 
-		// Transaction Metadata
-		fmt.Printf("Transaction Fee: %d\n", txn.Meta.Fee)
+		// Print transaction metadata
+		fmt.Println("\n=== Transaction Metadata ===")
+		fmt.Printf("Fee: %d\n", txn.Meta.Fee)
 		fmt.Printf("Pre-Balances: %v\n", txn.Meta.PreBalances)
 		fmt.Printf("Post-Balances: %v\n", txn.Meta.PostBalances)
 
-		// Token Balances
-		fmt.Println("Pre-Token Balances:")
-		for _, tb := range txn.Meta.PreTokenBalances {
-			fmt.Printf("  Mint: %s, Owner: %s, Amount: %s\n", tb.Mint, tb.Owner, tb.UIAmount.UIAmountStr)
-		}
+		// Print token balances
+		printTokenBalances("Pre-Token Balances", txn.Meta.PreTokenBalances)
+		printTokenBalances("Post-Token Balances", txn.Meta.PostTokenBalances)
 
-		fmt.Println("Post-Token Balances:")
-		for _, tb := range txn.Meta.PostTokenBalances {
-			fmt.Printf("  Mint: %s, Owner: %s, Amount: %s\n", tb.Mint, tb.Owner, tb.UIAmount.UIAmountStr)
-		}
 	}
 }
 
+// handleTransaction logs transaction details
 func handleTransaction(tx *solana.Transaction) {
-	// Extract signatures and convert to base58
-	var signatureStrings []string
+	signatures := []string{}
 	for _, signature := range tx.Signatures {
-		signatureStrings = append(signatureStrings, base58.Encode(signature[:]))
+		signatures = append(signatures, base58.Encode(signature[:]))
 	}
 
-	// Log the signatures
-	fmt.Println("Transaction Signatures:", signatureStrings)
+	fmt.Println("\n=== Transaction Details ===")
+	fmt.Printf("Signatures: %v\n", signatures)
 
-	// log the transaction as JSON
-	transactionJSON, err := json.MarshalIndent(tx, "", "  ")
-	if err != nil {
-		log.Fatalf("Failed to marshal transaction to JSON: %v", err)
-	}
-	fmt.Println("Transaction Details:", string(transactionJSON))
+	// txJSON, err := json.MarshalIndent(tx, "", "  ")
+	// if err != nil {
+	// 	log.Fatalf("Failed to marshal transaction to JSON: %v", err)
+	// }
+	// fmt.Println(string(txJSON))
 }
 
-func decodeInstruction(instr solana.CompiledInstruction, idl *IDLStructure, message solana.Message, programID solana.PublicKey) {
-	_ = message
-	_ = programID
+func decodeInstruction(instr solana.CompiledInstruction, idl *IDLStructure, message solana.Message) {
 
-	// Decode the instruction using the IDL
-	for _, idlInstr := range idl.Instructions {
-
-		fmt.Printf("Instruction Name: %s\n", idlInstr.Name)
+	// Check if instruction data is long enough for discriminator
+	if len(instr.Data) < 8 {
+		fmt.Printf("Instruction data too short (length: %d)\n", len(instr.Data))
 		fmt.Printf("Raw Data: %v\n", instr.Data)
+		return
+	}
 
-		// Parse arguments based on the IDL (TODO)
+	// Get discriminator
+	discriminator := instr.Data[:8]
+	fmt.Printf("Instruction Discriminator: %v\n", discriminator)
+
+	// Match instruction by name or discriminator
+	var matchedInstruction *struct {
+		Name     string   `json:"name"`
+		Docs     []string `json:"docs,omitempty"`
+		Accounts []struct {
+			Name     string   `json:"name"`
+			IsMut    bool     `json:"isMut"`
+			IsSigner bool     `json:"isSigner"`
+			Docs     []string `json:"docs,omitempty"`
+		} `json:"accounts,omitempty"`
+		Args []struct {
+			Name string `json:"name"`
+		} `json:"args,omitempty"`
+	}
+
+	// Match instruction
+	for i, instruction := range idl.Instructions {
+		fmt.Printf("Potential Instruction Match: %s\n", instruction.Name)
+		matchedInstruction = &idl.Instructions[i]
+		break
+	}
+
+	if matchedInstruction == nil {
+		fmt.Println("No matching instruction found in IDL")
+		return
+	}
+
+	fmt.Printf("Matched Instruction: %s\n", matchedInstruction.Name)
+
+	// Decode account arguments
+	fmt.Println("Account Arguments:")
+	for i, accountIndex := range instr.Accounts {
+		if i < len(matchedInstruction.Accounts) && int(accountIndex) < len(message.AccountKeys) {
+			accountInfo := matchedInstruction.Accounts[i]
+			accountKey := message.AccountKeys[accountIndex]
+
+			fmt.Printf("  %s (Index %d): %s\n",
+				accountInfo.Name,
+				accountIndex,
+				accountKey.String(),
+			)
+
+			fmt.Printf("    Mutable: %v, Signer: %v\n",
+				accountInfo.IsMut,
+				accountInfo.IsSigner,
+			)
+		}
+	}
+
+	// Decode instruction data
+	fmt.Println("Instruction Data:")
+	fmt.Printf("  Raw Data: %v\n", instr.Data)
+
+	// Attempt to parse instruction arguments
+	remainingData := instr.Data[8:] // Skip discriminator
+
+	if len(matchedInstruction.Args) > 0 {
+		fmt.Println("  Parsed Arguments:")
+
+		for _, arg := range matchedInstruction.Args {
+			if len(remainingData) == 0 {
+				break
+			}
+
+			// Basic argument parsing with safety checks
+			var value interface{}
+			if len(remainingData) >= 8 {
+				value = binary.LittleEndian.Uint64(remainingData[:8])
+				remainingData = remainingData[8:]
+			} else if len(remainingData) >= 4 {
+				value = binary.LittleEndian.Uint32(remainingData[:4])
+				remainingData = remainingData[4:]
+			} else if len(remainingData) >= 1 {
+				value = remainingData[0]
+				remainingData = remainingData[1:]
+			} else {
+				value = "<no data>"
+			}
+
+			fmt.Printf("    %s: %v\n", arg.Name, value)
+		}
+	}
+
+	// Print any remaining unparsed data
+	if len(remainingData) > 0 {
+		fmt.Printf("  Unparsed Data Remaining: %v\n", remainingData)
+	}
+
+	// Print documentation if available
+	if len(matchedInstruction.Docs) > 0 {
+		fmt.Println("Instruction Documentation:")
+		for _, doc := range matchedInstruction.Docs {
+			fmt.Println("  " + doc)
+		}
+	}
+}
+
+// printTokenBalances prints token balances for pre or post-transaction states
+func printTokenBalances(label string, balances []TokenBalance) {
+	if len(balances) > 0 {
+		fmt.Printf("\n=== %s ===\n", label)
+		for _, balance := range balances {
+			fmt.Printf("Account Index: %d, Mint: %s, Owner: %s, UI Amount: %+v\n",
+				balance.AccountIndex,
+				balance.Mint,
+				balance.Owner,
+				balance.UIAmount,
+			)
+		}
 	}
 }
